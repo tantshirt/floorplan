@@ -72,6 +72,7 @@ export function resolveRoutes(files) {
     for (const r of f.routes) {
       const defPrefix = (r.var && f.routers?.[r.var]) || '';
       const mw = mountMw(f.path, r.var);
+      if (r.framework === 'convex') { routes.push({ file: f.path, method: r.method, path: r.path, line: r.line, handler: r.handler, convex: true, ...(r.internal ? { internal: true } : {}), ...(r.doc ? { doc: r.doc } : {}) }); continue; }
       for (const mp of outerPrefixes(f.path, r.var)) routes.push({ file: f.path, method: r.method, path: joinPath(mp, defPrefix, r.path), line: r.line, ...(r.handler ? { handler: r.handler } : {}), ...(r.doc ? { doc: r.doc } : {}), ...(mw.length ? { mountMw: mw } : {}) });
     }
   }
@@ -113,12 +114,22 @@ function score(c, r) {
  * @returns [{ from, to, method, path, call, line }]
  */
 export function matchCalls(files, routes) {
-  const rs = routes.map((r) => ({ ...r, segs: routeSegments(r.path) }));
+  // Convex calls name their function exactly (api.grading.getLesson → /grading:getLesson), so they
+  // match by name and never fall into the URL scoring below.
+  const convexByPath = new Map();
+  for (const r of routes) if (r.convex) { if (!convexByPath.has(r.path)) convexByPath.set(r.path, []); convexByPath.get(r.path).push(r); }
+  const rs = routes.filter((r) => !r.convex).map((r) => ({ ...r, segs: routeSegments(r.path) }));
+  const convexOut = [];
+  for (const f of files) for (const call of f.calls || []) {
+    if (!call.convex) continue;
+    for (const r of convexByPath.get(call.path) || []) if (r.file !== f.path) convexOut.push({ from: f.path, to: r.file, method: r.method, path: r.path, call: call.path, line: call.line, routeLine: r.line });
+  }
   const pending = [];
   const learned = new Map(); // caller file or dir -> Map(prefix -> count)
   const learn = (key, prefix) => { if (!learned.has(key)) learned.set(key, new Map()); const m = learned.get(key); m.set(prefix, (m.get(prefix) || 0) + 1); };
   for (const f of files) {
     for (const call of f.calls || []) {
+      if (call.convex) continue;
       const cs = routeSegments(call.path);
       let best = -Infinity, hits = [];
       for (const r of rs) {
@@ -134,7 +145,7 @@ export function matchCalls(files, routes) {
     }
   }
   const top = (key) => { const m = learned.get(key); return m ? [...m.entries()].sort((a, b) => b[1] - a[1])[0][0] : null; };
-  const out = [];
+  const out = convexOut;
   for (const { f, call, hits } of pending) {
     let keep = hits;
     const pref = top(f.path) ?? top(dir(f.path));

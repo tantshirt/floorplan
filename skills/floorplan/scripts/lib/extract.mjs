@@ -195,10 +195,65 @@ function extractJs(src, filePath) {
   }
 
   const serverLine = /\b\w+\.(use|route)\(\s*["'`]\/|\b(?:app|server|fastify|hono|routes?|router|[a-z]+Router)\.(?:get|post|put|patch|delete|all|options|head)\(\s*["'`]\//;
+  convexRoutes(code, filePath, at, routes);
   const { calls, hosts } = extractCalls(code, at, { skip: serverLine });
   const seenCall = new Set(calls.map((c) => `${c.line}|${c.path}`));
   for (const c of wrapperCalls(code, at)) if (!seenCall.has(`${c.line}|${c.path}`)) calls.push(c);
+  calls.push(...convexCalls(code, imports, at));
   return { imports, symbols, routes, mounts, calls, hosts };
+}
+
+// ---------- Convex ----------
+// A Convex backend has no URLs: each exported query/mutation/action in convex/ is an endpoint,
+// named by its file and export ("grading:getLesson"), and the frontend calls it through the
+// generated `api` object: useQuery(api.grading.getLesson), ctx.runMutation(internal.jobs.send).
+
+const CONVEX_FILE = /(?:^|\/)convex\/(?!_generated\/)((?:[^/]+\/)*[^/.]+)\.(?:ts|js|mjs|tsx|jsx)$/;
+const CONVEX_EXPORT = /^[ \t]*export\s+(?:const\s+([A-Za-z_$][\w$]*)\s*(?::[^=\n]+)?=|default)\s*([A-Za-z_$][\w$]*)\s*(?:<[^>\n]*>)?\s*\(/gm;
+// `export const query = customQuery(…)` builds a wrapper; it isn't a function anyone calls
+const CONVEX_BUILDER = /^(?:z?custom|base|raw)|^(?:internal)?(?:query|mutation|action)$/i;
+
+function convexRoutes(code, filePath, at, routes) {
+  const mod = CONVEX_FILE.exec(filePath)?.[1];
+  if (!mod) return;
+  for (const m of code.matchAll(CONVEX_EXPORT)) {
+    const name = m[1] || 'default', builder = m[2];
+    const kind = /(query|mutation|action)$/i.exec(builder)?.[1];
+    if (!kind || /^http/i.test(builder) || /^z?custom/i.test(builder) || (m[1] && CONVEX_BUILDER.test(name))) continue;
+    routes.push({ method: kind.toUpperCase(), path: `/${mod}:${name}`, var: null, line: at(m.index), framework: 'convex', handler: name, ...(/internal/i.test(builder) ? { internal: true } : {}) });
+  }
+  // convex/http.ts: http.route({ path: "/stripe", method: "POST", handler: stripeWebhook })
+  if (/\bhttpRouter\s*\(/.test(code)) for (const m of code.matchAll(/\b[A-Za-z_$][\w$]*\.route\(\s*\{([^}]*)\}/g)) {
+    const path = /\bpath(?:Prefix)?\s*:\s*["'`]([^"'`]+)["'`]/.exec(m[1])?.[1];
+    const method = /\bmethod\s*:\s*["'`](\w+)["'`]/.exec(m[1])?.[1];
+    if (!path || !method) continue;
+    const handler = /\bhandler\s*:\s*([A-Za-z_$][\w$]*)/.exec(m[1])?.[1];
+    routes.push({ method: method.toUpperCase(), path: /pathPrefix/.test(m[1]) ? path.replace(/\/?$/, '/*') : path, var: null, line: at(m.index), framework: 'convex-http', ...(handler ? { handler } : {}) });
+  }
+}
+
+function convexCalls(code, imports, at) {
+  const roots = [];
+  for (const i of imports) if (/(^|\/)_generated\/api(\.[mc]?js)?$/.test(i.spec)) {
+    for (const [local, orig] of Object.entries(i.locals || {})) if (orig === 'api' || orig === 'internal') roots.push(local);
+  }
+  if (!roots.length) return [];
+  const out = [];
+  const seen = new Set();
+  // not part of a URL (https://api.github.com) and not a template placeholder (`api.users.${fn}`)
+  const re = new RegExp(`(?<![\\w$./-])(?:${roots.map((r) => r.replace(/\$/g, '\\$')).join('|')})((?:\\s*\\.\\s*[A-Za-z_$][\\w$]*)+)(?![\\w{$/.-])`, 'g');
+  for (const m of code.matchAll(re)) {
+    const parts = m[1].split('.').map((s) => s.trim()).filter(Boolean);
+    if (parts.length < 2) continue;
+    const fn = parts.pop();
+    if (fn === '$' || /^(com|org|net|io|app|dev|co)$/.test(fn)) continue;
+    const path = `/${parts.join('/')}:${fn}`;
+    const line = at(m.index);
+    if (seen.has(line + path)) continue;
+    seen.add(line + path);
+    out.push({ path, method: null, line, convex: true });
+  }
+  return out;
 }
 
 /**
@@ -485,6 +540,7 @@ function addDocs(src, lang, r) {
   const syms = (r.symbols || []).slice().sort((a, b) => a.line - b.line);
   for (const rt of r.routes || []) {
     if (rt.framework === 'next') { rt.handler = rt.method; continue; }
+    if (rt.framework === 'convex-http' && rt.handler) continue;
     const h = syms.find((s) => s.line >= rt.line && s.line - rt.line <= 12);
     if (h) { rt.handler = h.name; if (h.doc) rt.doc = h.doc; }
     else if (lang === 'python') {

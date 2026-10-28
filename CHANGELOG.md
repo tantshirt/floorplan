@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **Convex support:** apps built on Convex now show what each screen asks the backend for.
+  - Every exported query, mutation and action in `convex/` is an endpoint on the map, named by its file and export, for example `QUERY /orders:list`.
+  - `useQuery(api.orders.list)`, `ctx.runMutation(internal.jobs.send)` and every other use of the generated `api` / `internal` objects connect to the function they name.
+  - Webhooks registered with `http.route(...)` in `convex/http.ts` are endpoints too.
+  - `convex/_generated/` is left off the map, so the generated API file no longer links every screen to every backend file.
+- **Health for Convex:** public functions that never check who is calling are reported, the same way open endpoints are. Internal functions are skipped, since only the backend can call them. Sign-in checks count when they're in the function, in a helper in the same file, or in an internal check function it calls.
+- **Fewer false Health alarms:** sample secrets labelled as bad examples (`vulnerable_example:` in a security checklist, for instance) are no longer reported as leaked keys.
+
 ## 0.1.2 (2026-10-27)
 
 - **Floorplan Cloud waitlist:** once a map has been open for two minutes, a corner card asks, once, whether you'd like an email when Floorplan Cloud (shared, synced team maps) launches. Nothing is sent unless you click **Notify me**, and then only your email and "just me" or "with my team". **Use my Claude email** fills in your Claude account's address, and you see it before anything is sent. **Don't ask again**, or `FLOORPLAN_NO_PROMPTS=1`, turns it off. See [Privacy and security](docs/privacy-and-security.md#floorplan-cloud-waitlist).

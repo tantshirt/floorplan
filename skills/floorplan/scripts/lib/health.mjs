@@ -152,8 +152,10 @@ function findSecrets(src, f, out) {
   const throwawayDb = /(^|\/)\.github\/|(^|\/)(docker-)?compose[\w.-]*\.ya?ml$/i.test(f.path);
   const quoted = /(["']?)([A-Za-z_][\w.-]*)\1\s*(?::=|=>|=|:)\s*(?:[rbuRBU]{1,2})?(["'`])([^"'`\n]{6,200})\3/g;
   const unquoted = /^\s*(?:export\s+)?([A-Za-z_][\w.-]*)\s*[:=]\s*([^\s#'"]{6,200})\s*(?:#.*)?$/;
+  // the "don't do this" samples in a security checklist: vulnerable_example: | SECRET_KEY = "…"
+  const badExample = (i) => lines.slice(Math.max(0, i - 4), i + 1).some((l) => /\b(vulnerable|insecure|unsafe|bad|wrong|bad_code|noncompliant)[_ -]?(example|code|sample|snippet)s?\b/i.test(l));
   lines.forEach((text, i) => {
-    if (text.length > 400 || ENV_LOOKUP.test(text) || inDoc.has(i + 1) || /^\s*(#|\/\/|\*|\/\*|<!--)/.test(text)) return;
+    if (text.length > 400 || ENV_LOOKUP.test(text) || inDoc.has(i + 1) || /^\s*(#|\/\/|\*|\/\*|<!--)/.test(text) || badExample(i)) return;
     const pairs = [...text.matchAll(quoted)].map((m) => [m[2], m[4]]);
     if (!pairs.length && (f.category === 'config' && CONFIG_LANGS.has(f.lang))) { const u = unquoted.exec(text); if (u) pairs.push([u[1], u[2]]); }
     for (const [name, value] of pairs) {
@@ -175,6 +177,8 @@ const isGuardName = (name) => !!name && !NOT_GUARD.test(name) && GUARD_NAME.test
 const INLINE_CHECK = /request\.headers(?:\.get)?\(?\s*\[?\s*['"](authorization|x-api-key|x-[\w-]*(token|key|secret|signature)[\w-]*)['"]|req\.headers(?:\.|\[\s*['"])(authorization|x-api-key)|\b(verify|check|require|validate|authenticate|authorize)_?\w*(auth|token|session|user|key|signature|webhook|hmac|jwt|device|staff|admin|permission|role|request|caller)\w*\s*\(|\bcurrent_user\b|get_jwt_identity|verify_jwt_in_request|compare_digest|abort\(\s*40[13]\b|,\s*40[13]\s*\)?\s*$|status(?:Code)?\s*[:=(]\s*40[13]\b|\.status\(\s*40[13]\s*\)|req\.user\b|req\.session\.user|req\.auth\b|jwt\.verify|jwtVerify|getServerSession|auth\(\)|currentUser\(|getAuth\(|auth\.getUser|getSession\(|verifyIdToken|getToken\(/m;
 const SIGNATURE_CHECK = /hmac|signature|verify_?webhook|construct_?event|x-hub-signature|compare_digest|svix|webhooks?\.verify|jwt\.decode|oidc|id_token|authenticated|verify_\w*(token|request|push)/i;
 const NEXT_GUARD = /getServerSession|\bauth\(\)|currentUser\(|getAuth\(|auth\.getUser|supabase\.auth\.get(User|Session)|getSession\(|verifyIdToken|jwt\.verify|jwtVerify|getToken\(|clerkClient|requireAuth|requireUser|withAuth|validateRequest|headers\(\)\.get\(\s*['"]authorization|status:\s*40[13]\b/;
+// a Convex function that looks up who is calling (ctx.auth, a viewer helper, or a require/assert check)
+const CONVEX_GUARD = /ctx\.auth\.getUserIdentity|\bgetUserIdentity\(|\bctx\.viewer|\bviewer\w*\b|\b(require|assert|ensure)[A-Z]\w*\s*\(|\b(check|verify|get|issue|with)\w*(Auth|Viewer|User|Admin|Role|Identity|Session|Member|Permission|Access|Owner|Staff)\w*\s*\(|\bis\w*(Admin|Staff|Owner|Member|Authorized|Authenticated)\w*\b|\bgetAuthUserId\(|\binternal\.[\w.]*\.(assert|require|ensure|check|verify|is)[A-Z]\w*|\bauthorize\w*\(|\b(serverToken|internalToken|sharedSecret)\b/;
 const NEXT_MIDDLEWARE_GUARD = /getToken|withAuth|clerkMiddleware|authMiddleware|auth\(|supabase|getSession|jwtVerify|jwt\.verify|cookies\.get\([^)]*(session|token|auth)|redirect\([^)]*login/i;
 
 function blockAfter(lines, defIdx) {
@@ -250,6 +254,21 @@ function pyRoutes(src, f, out) {
   }
 }
 
+/** The handler hands ctx to a helper in the same file that checks who is calling. */
+function convexGuardedHelper(body, src) {
+  // ctx.runMutation(internal.<this file>.prepare, …) where prepare checks the caller
+  for (const m of body.matchAll(/\binternal((?:\s*\.\s*[A-Za-z_$][\w$]*)+)/g)) {
+    const fn = m[1].split('.').pop().trim();
+    const def = new RegExp(`\\bexport\\s+const\\s+${fn}\\s*=[\\s\\S]{0,3000}`).exec(src)?.[0];
+    if (def && CONVEX_GUARD.test(def.split(/\n\s*export\s/)[0])) return true;
+  }
+  for (const m of body.matchAll(/\b([A-Za-z_$][\w$]*)\s*\(\s*ctx\b/g)) {
+    const def = new RegExp(`(?:function\\s+${m[1]}\\b|\\b${m[1]}\\s*=\\s*(?:async\\s*)?\\()[\\s\\S]{0,3000}`).exec(src)?.[0];
+    if (def && CONVEX_GUARD.test(def)) return true;
+  }
+  return false;
+}
+
 function jsRoutes(src, f, out) {
   const routes = f.routes || [];
   if (!routes.length && !/\.use\(/.test(src) && !/(^|\/)middleware\.(t|j)s$/.test(f.path)) return;
@@ -269,6 +288,28 @@ function jsRoutes(src, f, out) {
 
   routes.forEach((r, idx) => {
     const rec = { k: 'route', line: r.line, method: r.method };
+    if (r.framework === 'convex') {
+      // internal functions can't be called from outside, only by the backend itself
+      if (r.internal) return;
+      const end = routes.slice(idx + 1).find((o) => o.framework === 'convex')?.line || lines.length + 1;
+      const body = lines.slice(r.line - 1, end - 1).join('\n');
+      // a handler that never receives ctx can't touch data (retired functions that only throw)
+      if (CONVEX_GUARD.test(body) || convexGuardedHelper(body, src) || /\bhandler\s*:\s*(?:async\s*)?\(\s*\)\s*=>|\bhandler\s*\(\s*\)\s*\{/.test(body)) rec.via = 'inline';
+      // a secret link (unsubscribe, invite, magic link): knowing the token is the permission
+      else if (/\bargs\s*:\s*\{[^}]*\b\w*[tT]oken\s*:/.test(body)) rec.via = 'inline';
+      rec.fn = r.handler;
+      out.push(rec);
+      return;
+    }
+    if (r.framework === 'convex-http') {
+      // the handler usually lives in the same http.ts file
+      const fnBody = r.handler && new RegExp(`(?:function\\s+${r.handler}\\b|\\b${r.handler}\\s*=)[\\s\\S]{0,4000}`).exec(src)?.[0];
+      if (fnBody && SIGNATURE_CHECK.test(fnBody)) rec.signed = true;
+      if (fnBody && INLINE_CHECK.test(fnBody)) rec.via = 'inline';
+      rec.fn = r.handler;
+      out.push(rec);
+      return;
+    }
     if (r.framework === 'next') {
       if (NEXT_GUARD.test(src)) rec.via = 'inline';
       if (SIGNATURE_CHECK.test(src)) rec.signed = true;
@@ -491,7 +532,7 @@ export function buildHealth({ graph, scan, arch, root }) {
     if (webhook && fnd.signed) return;
     if (!webhook && PUBLIC_PATH.test(r.p.replace(/<[^>]*>|\{[^}]*\}|:\w+|\[[^\]]*\]/g, 'x'))) return;
     if (r.p === '/' && r.m === 'GET') return;
-    const entry = { i, r, fnd, write: !['GET', 'ANY'].includes(r.m), webhook };
+    const entry = { i, r, fnd, write: !['GET', 'ANY', 'QUERY'].includes(r.m), webhook };
     if (fnd.misplaced) pr.misplaced.push(entry); else pr.open.push(entry);
   });
   for (const [repo, pr] of perRepo) {
